@@ -56,3 +56,6 @@ function stan_glm(formula::FormulaTerm, data::DataFrame; kwargs...)
 
     return fit
 end
+export module
+    
+end
