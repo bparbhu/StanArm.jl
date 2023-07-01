@@ -1,5 +1,6 @@
 using Stan, StatsModels, Statistics, StatsBase, DataFrames, MLBase
 
+
 function stan_glm(formula::Term, data::DataFrame; 
                   family = "gaussian", 
                   weights = nothing,
@@ -67,12 +68,4 @@ function stan_glm(formula::Term, data::DataFrame;
                            adapt_delta = adapt_delta, QR = QR, sparse = sparse)
 
     return stanfit
-end
-
-# Placeholder for the function that fits the GLM with Stan.
-function stan_glm_fit(; x, y, weights, offset, family, prior, prior_intercept, prior_aux, 
-                       prior_PD, algorithm, mean_PPD, adapt_delta, QR, sparse)
-    # The implementation of this function will need to generate Stan code based on the input arguments,
-    # prepare the data for Stan, compile the Stan model, and fit the model with Stan.
-    # The results from Stan will then need to be returned.
 end
