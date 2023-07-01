@@ -1,5 +1,7 @@
 using Statistics, LinearAlgebra, Random, StatsBase, SpecialFunctions
-
+using SparseArrays
+using DataFrames
+using NamedTupleTools
 
 function stan_glm_fit(x, y;
     weights = ones(length(y)),
@@ -662,10 +664,344 @@ function stan_glm_fit(x, y;
         end
 end
 
+function supported_glm_links(famname::String)
+    link_dict = Dict(
+      "binomial" => ["logit", "probit", "cauchit", "log", "cloglog"],
+      "gaussian" => ["identity", "log", "inverse"],
+      "Gamma" => ["identity", "log", "inverse"],
+      "inverse.gaussian" => ["identity", "log", "inverse", "1/mu^2"],
+      "poisson" => ["log", "identity", "sqrt"],
+      "Beta regression" => ["logit", "probit", "cloglog", "cauchit"]
+    )
+    if haskey(link_dict, famname)
+      return link_dict[famname]
+    else
+      error("unsupported family")
+    end
+  end
+  
+
+function stan_family_number(famname::String)
+family_number_dict = Dict(
+    "gaussian" => 1,
+    "Gamma" => 2,
+    "inverse.gaussian" => 3,
+    "beta" => 4,
+    "Beta regression" => 4,
+    "binomial" => 5,
+    "poisson" => 6,
+    "neg_binomial_2" => 7
+)
+if haskey(family_number_dict, famname)
+    return family_number_dict[famname]
+else
+    error("Family not valid.")
+end
+end
+
+
+
+function validate_glm_outcome_support(y, family)
+    function is_count(x)
+        all(x .>= 0) && all(abs.(x .- round.(x)) .< sqrt(eps(Float64)))
+    end
+
+    fam = family["family"]
+
+    if !isbinomial(fam)
+        if ndims(y) > 1
+            if size(y, 2) == 1
+                y = y[:, 1]
+            else
+                error("Except for binomial models the outcome variable should not have multiple columns.")
+            end
+        end
+
+        if isgaussian(fam)
+            return y
+        elseif isgamma(fam) && any(y .<= 0)
+            error("All outcome values must be positive for gamma models.")
+        elseif isig(fam) && any(y .<= 0)
+            error("All outcome values must be positive for inverse-Gaussian models.")
+        elseif ispoisson(fam) && !is_count(y)
+            error("All outcome values must be counts for Poisson models")
+        elseif isnb(fam) && !is_count(y)
+            error("All outcome values must be counts for negative binomial models")
+        end
+    else
+        if size(y, 2) == 1
+            if isnumeric(y) || islogical(y)
+                y = convert.(Int, y)
+            end
+            if isfactor(y)
+                y = fac2bin(y)
+            end
+            if !all(in([0, 1]), y)
+                error("All outcome values must be 0 or 1 for Bernoulli models.")
+            end
+        elseif size(y, 2) == 2
+            if !is_count(y)
+                error("All outcome values must be counts for binomial models.")
+            end
+        else
+            error("For binomial models the outcome should be a vector or a matrix with 2 columns.")
+        end
+    end
+
+    return y
+end
+
+
+function fake_y_for_prior_PD(N, family)
+    fam = family["family"]
+    if isgaussian(fam)
+        fake_y = zscore(randn(N))
+    elseif isbinomial(fam) || ispoisson(fam) || isnb(fam)
+        fake_y = repeat([0, 1], outer = N ÷ 2)
+        if N % 2 == 1
+            append!(fake_y, 0)
+        end
+    else
+        fake_y = rand(N)
+    end
+    return fake_y
+end
+
+
+function pad_reTrms(Ztlist, cnms, flist)
+    l = [nlevels(flist[i]) for i in attr(flist, "assign")]
+    p = [length(x) for x in cnms]
+    n = size(Ztlist[1], 2)
+    for i in attr(flist, "assign")
+        flist[i] = replace(flist[i], r" " => "_") 
+        flist[i] = vcat(flist[i], "_NEW_" .* names(flist)[i])
+    end
+    for i in 1:length(p)
+        Ztlist[i] = vcat(Ztlist[i], spzeros(p[i], n))
+    end
+    Z = transpose(vcat(Ztlist...))
+    return ntuple(Z, cnms, flist)
+end
+
+function unpad_reTrms(x, args...; columns=true)
+    if size(x)[end] > 3
+        error("'x' should be a matrix or 3-D array")
+    end
+    
+    nms = columns ? last_dimnames(x) : rownames(x)
+    keep = .!occursin("_NEW_", nms)
+    if ndims(x) == 2
+        x_keep = columns ? x[:, keep] : x[keep, :]
+    else
+        x_keep = columns ? x[:, :, keep] : x[keep, :, :]
+    end
+    return x_keep
+end
+
+unpad_reTrms(x::AbstractMatrix, args...) = unpad_reTrms(x, args...)
+unpad_reTrms(x::AbstractArray, args...) = unpad_reTrms(x, args...)
+unpad_reTrms(x, args...) = x[.!occursin("_NEW_", names(x))]
+
+
+function make_b_nms(group; m=nothing, stub="Long")
+    group_nms = names(group["cnms"])
+    b_nms = String[]
+    m_stub = m != nothing ? get_m_stub(m, stub=stub) : nothing
+    for i in 1:length(group["cnms"])
+        nm = group_nms[i]
+        nms_i = string.(group["cnms"][i], nm)
+        levels = replace.(levels(group["flist"][nm]), r" " => "_")
+        if length(nms_i) == 1
+            append!(b_nms, string.(m_stub, nms_i, ":", levels))
+        else
+            for n in nms_i
+                append!(b_nms, string.(m_stub, n, ":", levels))
+            end
+        end
+    end
+    return b_nms
+end
+
+
+function summarize_glm_prior(user_prior,
+                             user_prior_intercept,
+                             user_prior_aux,
+                             user_prior_covariance,
+                             has_intercept, 
+                             has_predictors,
+                             adjusted_prior_scale,
+                             adjusted_prior_intercept_scale, 
+                             adjusted_prior_aux_scale,
+                             family)
+
+    rescaled_coef = user_prior[:prior_autoscale] && 
+                    has_predictors &&
+                    !isna(user_prior[:prior_dist_name]) &&
+                    !all(user_prior[:prior_scale] .== adjusted_prior_scale)
+    rescaled_int = user_prior_intercept[:prior_autoscale_for_intercept] &&
+                   has_intercept &&
+                   !isna(user_prior_intercept[:prior_dist_name_for_intercept]) &&
+                   (user_prior_intercept[:prior_scale_for_intercept] != adjusted_prior_intercept_scale)
+    rescaled_aux = user_prior_aux[:prior_autoscale_for_aux] &&
+                   !isna(user_prior_aux[:prior_dist_name_for_aux]) &&
+                   (user_prior_aux[:prior_scale_for_aux] != adjusted_prior_aux_scale)
+
+    if has_predictors && user_prior[:prior_dist_name] in "t"
+        if all(user_prior[:prior_df] .== 1)
+            user_prior[:prior_dist_name] = "cauchy"
+        else
+            user_prior[:prior_dist_name] = "student_t"
+        end
+    end
+    if has_intercept && user_prior_intercept[:prior_dist_name_for_intercept] in "t"
+        if all(user_prior_intercept[:prior_df_for_intercept] .== 1)
+            user_prior_intercept[:prior_dist_name_for_intercept] = "cauchy"
+        else
+            user_prior_intercept[:prior_dist_name_for_intercept] = "student_t"
+        end
+    end
+    if user_prior_aux[:prior_dist_name_for_aux] in "t"
+        if all(user_prior_aux[:prior_df_for_aux] .== 1)
+            user_prior_aux[:prior_dist_name_for_aux] = "cauchy"
+        else
+            user_prior_aux[:prior_dist_name_for_aux] = "student_t"
+        end
+    end
+    prior_list = Dict(
+        :prior => if !has_predictors
+                    nothing
+                else
+                    Dict(
+                        :dist => user_prior[:prior_dist_name],
+                        :location => user_prior[:prior_mean],
+                        :scale => user_prior[:prior_scale],
+                        :adjusted_scale => if rescaled_coef
+                                            adjusted_prior_scale
+                                        else
+                                            nothing
+                                        end,
+                        :df => if user_prior[:prior_dist_name] in 
+                                    ["student_t", "hs", "hs_plus", "lasso", "product_normal"]
+                                user_prior[:prior_df]
+                            else
+                                nothing
+                            end
+                    )
+                end,
+        :prior_intercept => if !has_intercept
+                                nothing
+                            else
+                                Dict(
+                                    :dist => user_prior_intercept[:prior_dist_name_for_intercept],
+                                    :location => user_prior_intercept[:prior_mean_for_intercept],
+                                    :scale => user_prior_intercept[:prior_scale_for_intercept],
+                                    :adjusted_scale => if rescaled_int
+                                                        adjusted_prior_intercept_scale
+                                                    else
+                                                        nothing
+                                                    end,
+                                    :df => if user_prior_intercept[:prior_dist_name_for_intercept] in "student_t"
+                                            user_prior_intercept[:prior_df_for_intercept]
+                                        else
+                                            nothing
+                                        end
+                                )
+                            end
+    )
+
+    if length(user_prior_covariance) > 0
+        prior_list[:prior_covariance] = user_prior_covariance
+    end
+
+    aux_name = rename_aux(family)
+
+    prior_list[:prior_aux] = if isna(aux_name)
+                                nothing
+                            else
+                                Dict(
+                                    :dist => user_prior_aux[:prior_dist_name_for_aux],
+                                    :location => if !isna(user_prior_aux[:prior_dist_name_for_aux]) && 
+                                                    user_prior_aux[:prior_dist_name_for_aux] != "exponential"
+                                                user_prior_aux[:prior_mean_for_aux]
+                                            else
+                                                nothing
+                                            end,
+                                    :scale => if !isna(user_prior_aux[:prior_dist_name_for_aux]) && 
+                                                    user_prior_aux[:prior_dist_name_for_aux] != "exponential"
+                                                user_prior_aux[:prior_scale_for_aux]
+                                            else
+                                                nothing
+                                            end,
+                                    :adjusted_scale => if rescaled_aux
+                                                        adjusted_prior_aux_scale
+                                                    else
+                                                        nothing
+                                                    end,
+                                    :df => if !isna(user_prior_aux[:prior_dist_name_for_aux]) && 
+                                                user_prior_aux[:prior_dist_name_for_aux] in "student_t"
+                                            user_prior_aux[:prior_df_for_aux]
+                                        else
+                                            nothing
+                                        end,
+                                    :rate => if !isna(user_prior_aux[:prior_dist_name_for_aux]) && 
+                                                    user_prior_aux[:prior_dist_name_for_aux] in "exponential"
+                                                1 / user_prior_aux[:prior_scale_for_aux]
+                                            else
+                                                nothing
+                                            end,
+                                    :aux_name => aux_name
+                                )
+                            end
+
+    return prior_list
+end
+
+# rename aux parameter based on family
+function rename_aux(family)
+    fam = family[:family]
+    if isgaussian(fam)
+        return "sigma"
+    elseif isgamma(fam)
+        return "shape"
+    elseif isig(fam)
+        return "lambda"
+    elseif isnb(fam)
+        return "reciprocal_dispersion"
+    else
+        return nothing
+    end
+end
+
+# sample_indices function
+function sample_indices(wts, n_draws)
+    K = length(wts)
+    w = n_draws .* wts # expected number of draws from each model
+    idx = fill(nothing, n_draws)
+
+    c = 0
+    j = 0
+
+    for k in 1:K
+        c += w[k]
+        if c >= 1
+            a = floor(Int, c)
+            c -= a
+            idx[j+1:a] .= k
+            j += a
+        end
+        if j < n_draws && c >= rand()
+            c -= 1
+            j += 1
+            idx[j] = k
+        end
+    end
+    return idx
+end
+
 
 function match_arg(input, options = ["sampling", "optimizing", "meanfield", "fullrank"])
-if input ∉ options
-throw(ArgumentError("Invalid algorithm. Choices are: " * join(options, ", ")))
-end
+    if input ∉ options
+    throw(ArgumentError("Invalid algorithm. Choices are: " * join(options, ", ")))
+    end
 return input
 end
