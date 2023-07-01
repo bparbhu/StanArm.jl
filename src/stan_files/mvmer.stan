@@ -1,5 +1,4 @@
-#include /pre/Columbia_copyright.stan
-#include /pre/Brilleman_copyright.stan
+#include /pre/bparbhu_copyright.stan
 #include /pre/license.stan
 
 // Multivariate GLM with correlated group-specific terms
