@@ -1,4 +1,4 @@
-#include /pre/Columbia_copyright.stan
+#include /pre/bparbhu_copyright.stan
 #include /pre/license.stan
 
 // GLM for a Gaussian, Gamma, inverse Gaussian, or Beta outcome
