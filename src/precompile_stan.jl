@@ -3,7 +3,7 @@ using Pkg.Artifacts
 
 function precompile_model(model_name::String, model_path::String)
     # Read the Stan model code
-    model_code = read(model_path, String)
+    model_code = join(readlines(model_path), "\n")
 
     # Create a Stan model and compile it
     model = Stanmodel(name=model_name, model=model_code, output_format=:mcmcchains)
@@ -19,7 +19,7 @@ function precompile_model(model_name::String, model_path::String)
 end
 
 models = [
-    ("stan_glm", "src/stan_files/models/stan_glm.stan")
+    ("bernoulli", "src/stan_files/bernoulli.stan")
 ]
 
 artifacts = Dict{String, String}()
